@@ -88,6 +88,12 @@ options:
     required: true
     default: null
     aliases: []
+  multipart:
+    description:
+      - Uses multipart API for "PUT" operations. Use for files larger than 5GB
+    required: false
+    default: False
+    aliases: []
   object:
     description:
       - Keyname of the object inside the bucket. Can be used to create "virtual directories", see examples.
@@ -313,6 +319,42 @@ def upload_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, heade
     except s3.provider.storage_copy_error, e:
         module.fail_json(msg= str(e))
 
+
+def upload_multipart_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers):
+    # 5GB limit for single PUT operation in S3
+    chunk_size_in_mb = 5000
+    bucket = s3.lookup(bucket)
+    mpart = bucket.initiate_multipart_upload(obj, encrypt_key=encrypt, headers=headers)
+
+    try:
+        if metadata:
+            for meta_key in metadata.keys():
+                key.set_metadata(meta_key, metadata[meta_key])
+
+        file_size = os.path.getsize(src)
+
+        with open(src, 'rb') as srcfile:
+            chunk_size = chunk_size_in_mb * 1024 * 1024
+            bytes_read = 0
+            chunk_count = 1
+
+            while bytes_read < file_size:
+                # Read for chunk size or remaining bytes, if at end of file)
+                bytes_remaining = file_size - bytes_read
+                bytes_to_read = min(chunk_size, bytes_remaining)
+                # Currently will overwrite any parts if the whole is present
+                mp.upload_part_from_file(fp=srcfile, part_num=chunk_count, size=bytes_to_read)
+                chunk_count += 1
+                bytes_read += bytes_to_read
+
+        completed_mp = mpart.complete_upload()
+        url = completed.location
+        module.exit_json(msg="PUT operation complete", url=url, changed=True)
+    except s3.provider.storage_copy_error, e:
+        module.fail_json(msg= str(e))
+        mpart.cancel_upload()
+
+
 def download_s3file(module, s3, bucket, obj, dest, retries, version=None):
     # retries is the number of loops; range/xrange needs to be one
     # more to get that count of loops.
@@ -379,6 +421,7 @@ def main():
             max_keys       = dict(default=1000),
             metadata       = dict(type='dict'),
             mode           = dict(choices=['get', 'put', 'delete', 'create', 'geturl', 'getstr', 'delobj', 'list'], required=True),
+            multipart      = dict(default=False, type='bool')
             object         = dict(),
             permission     = dict(type='list', default=['private']),
             version        = dict(default=None),
@@ -404,6 +447,7 @@ def main():
     max_keys = module.params.get('max_keys')
     metadata = module.params.get('metadata')
     mode = module.params.get('mode')
+    multipart = module.params.get('multipart')
     obj = module.params.get('object')
     version = module.params.get('version')
     overwrite = module.params.get('overwrite')
@@ -548,24 +592,36 @@ def main():
                 if md5_local == md5_remote:
                     sum_matches = True
                     if overwrite == 'always':
-                        upload_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
+                        if multipart is False:
+                            upload_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
+                        else:
+                            upload_multipart_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
                     else:
                         get_download_url(module, s3, bucket, obj, expiry, changed=False)
                 else:
                     sum_matches = False
                     if overwrite in ('always', 'different'):
-                        upload_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
+                        if multipart is False:
+                            upload_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
+                        else:
+                            upload_multipart_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
                     else:
                         module.exit_json(msg="WARNING: Checksums do not match. Use overwrite parameter to force upload.")
 
         # If neither exist (based on bucket existence), we can create both.
         if bucketrtn is False and pathrtn is True:
             create_bucket(module, s3, bucket, location)
-            upload_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
+            if multipart is False:
+                upload_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
+            else:
+                upload_multipart_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
 
         # If bucket exists but key doesn't, just upload.
         if bucketrtn is True and pathrtn is True and keyrtn is False:
-            upload_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
+            if multipart is False:
+                upload_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
+            else:
+                upload_multipart_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
 
     # Delete an object from a bucket, not the entire bucket
     if mode == 'delobj':
