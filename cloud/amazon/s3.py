@@ -35,7 +35,7 @@ options:
     default: null
     aliases: ['ec2_secret_key', 'secret_key']
   bucket:
-    description: 
+    description:
       - Bucket name.
     required: true
     default: null
@@ -89,7 +89,7 @@ options:
     version_added: "1.6"
   mode:
     description:
-      - Switches the module behaviour between put (upload), get (download), geturl (return download url (Ansible 1.3+), getstr (download object as string (1.3+)), list (list keys (2.0+)), create (bucket), delete (bucket), and delobj (delete object).
+      - Switches the module behaviour between put (upload), get (download), geturl (return download url (Ansible 1.3+), getstr (download object as string (1.3+)), list (list keys (2.0+)), create (bucket), delete (bucket), delobj (delete object), list_multipart (lists all multipart uploads in progress), and cancel_multipart (cancels all multipart uploads for a key).
     required: true
     default: null
     aliases: []
@@ -142,12 +142,12 @@ options:
     default: 0
     version_added: "2.0"
   s3_url:
-    description: 
+    description:
       - S3 URL endpoint for usage with Eucalypus, fakes3, etc.  Otherwise assumes AWS
     default: null
     aliases: [ S3_URL ]
   src:
-    description: 
+    description:
       - The source file path when performing a PUT operation.
     required: false
     default: null
@@ -239,7 +239,7 @@ def keysum(module, s3, bucket, obj, version=None):
     # ignore count side of the etag if file was multipart
     if '-' in md5_remote:
         md5_remote, file_count = md5_remote.split('-')
-    
+
     return md5_remote
 
 def calculate_multipart_md5(src, chunk_size_in_mb):
@@ -249,8 +249,8 @@ def calculate_multipart_md5(src, chunk_size_in_mb):
         1.) gets the raw md5 bytes of each file part
         2.) concatenates them into a single string/byte array
         3.) sets etag to the hexdigest of this collection of bytes
-    
-    Note: the same file will have a different "multipart hash" if different 
+
+    Note: the same file will have a different "multipart hash" if different
         chunk sizes are used
     """
     file_size = os.path.getsize(src)
@@ -273,7 +273,7 @@ def calculate_multipart_md5(src, chunk_size_in_mb):
             all_chunk_md5.append(_m.digest())
 
             bytes_read += bytes_to_read
-    
+
     # Concatenate all bytes and return *hexdigest* md5
     full_md5_bytes = ''.join(all_chunk_md5)
     final_md5 = md5(full_md5_bytes).hexdigest()
@@ -373,7 +373,7 @@ def upload_multipart_s3file(module, s3, bucket, obj, src, expiry, metadata, encr
     """
     if chunk_size_in_mb < 5 or chunk_size_in_mb > 5000:
         module.fail_json(msg='Chunk Size must be between 5 and 5000 MB. Default: 1024')
-        
+
     bucket = s3.lookup(bucket)
     mpart = bucket.initiate_multipart_upload(obj, encrypt_key=encrypt, headers=headers)
 
@@ -398,7 +398,7 @@ def upload_multipart_s3file(module, s3, bucket, obj, src, expiry, metadata, encr
                 bytes_read += bytes_to_read
 
         completed_mpart = mpart.complete_upload()
-        
+
         # Set permissions and get URL for completed file
         mp_key = bucket.get_key(completed_mpart.key_name)
         mp_key.set_acl(module.params.get('permission'))
@@ -463,6 +463,38 @@ def is_walrus(s3_url):
         return False
 
 
+def get_all_multipart_uploads(module, s3, bucket):
+    try:
+        bucket = s3.lookup(bucket)
+        mp_results = bucket.list_multipart_uploads()
+
+        all_mp_uploads = dict()
+        for mp_upload in mp_results:
+            all_mp_uploads[mp_upload.id] = mp_upload.key_name
+
+        module.exit_json(msg="List Current Multipart Operations Completed",
+                         results=all_mp_uploads)
+    except s3.provider.storage_response_error, e:
+        module.fail_json(msg= str(e))
+
+
+def cancel_multipart_upload(module, s3, bucket, obj):
+    try:
+        bucket = s3.lookup(bucket)
+        mp_results = bucket.list_multipart_uploads()
+
+        canceled = []
+        for mp_upload in mp_results:
+            if mp_upload.key_name == obj:
+                mp_upload.cancel_upload()
+                canceled.append(mp_upload.id)
+
+        module.exit_json(msg="Canceled Multipart Upload(s)",
+                         results=canceled)
+    except s3.provider.storage_response_error, e:
+        module.fail_json(msg= str(e))
+
+
 def main():
     argument_spec = ec2_argument_spec()
     argument_spec.update(dict(
@@ -475,7 +507,7 @@ def main():
             marker         = dict(default=None),
             max_keys       = dict(default=1000),
             metadata       = dict(type='dict'),
-            mode           = dict(choices=['get', 'put', 'delete', 'create', 'geturl', 'getstr', 'delobj', 'list'], required=True),
+            mode           = dict(choices=['get', 'put', 'delete', 'create', 'geturl', 'getstr', 'delobj', 'list', 'list_multipart', 'cancel_multipart'], required=True),
             multipart      = dict(default=False, type='bool'),
             object         = dict(),
             permission     = dict(type='list', default=['private']),
@@ -645,7 +677,7 @@ def main():
             if multipart is False:
                 md5_local = module.md5(src)
             else:
-                # md5 is different for 
+                # AWS calculates "etag" differently for multipart uploads
                 md5_local = calculate_multipart_md5(src, chunk_size)
 
             if md5_local == md5_remote:
@@ -775,6 +807,23 @@ def main():
                         module.fail_json(msg="Key %s with version id %s does not exist."% (obj, version), failed=True)
                     else:
                         module.fail_json(msg="Key %s does not exist."%obj, failed=True)
+
+    if mode == 'list_multipart':
+        if bucket:
+            bucketrtn = bucket_check(module, s3, bucket)
+            if bucketrtn is False:
+                module.fail_json(msg="Bucket %s does not exist."%bucket, failed=True)
+            else:
+                get_all_multipart_uploads(module, s3, bucket)
+
+    if mode == 'cancel_multipart':
+        if bucket and obj:
+            bucketrtn = bucket_check(module, s3, bucket)
+            if bucketrtn is False:
+                module.fail_json(msg="Bucket %s does not exist."%bucket, failed=True)
+            else:
+                cancel_multipart_upload(module, s3, bucket, obj)
+
 
     module.exit_json(failed=False)
 
