@@ -401,7 +401,8 @@ def upload_multipart_s3file(module, s3, bucket, obj, src, expiry, metadata, encr
 
         # Set permissions and get URL for completed file
         mp_key = bucket.get_key(completed_mpart.key_name)
-        mp_key.set_acl(module.params.get('permission'))
+        for acl in module.params.get('permission'):
+            mp_key.set_acl(acl)
         url = mp_key.generate_url(expiry)
         module.exit_json(msg="PUT operation complete", url=url, changed=True)
     except s3.provider.storage_copy_error, e:
