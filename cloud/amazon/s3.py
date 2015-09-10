@@ -40,6 +40,11 @@ options:
     required: true
     default: null
     aliases: []
+  chunk_size:
+    description:
+      - Size of file parts in MB when "multipart" is true. S3 Max/Min: 5GB/5MB
+    required: false
+    default: 1024
   dest:
     description:
       - The destination file path when downloading an object/key with a GET operation.
@@ -197,6 +202,7 @@ EXAMPLES = '''
 import os
 import urlparse
 from ssl import SSLError
+from hashlib import md5
 
 try:
     import boto
@@ -228,11 +234,52 @@ def keysum(module, s3, bucket, obj, version=None):
     key_check = bucket.get_key(obj, version_id=version)
     if not key_check:
         return None
+    # boto returns an escape-quoted hash
     md5_remote = key_check.etag[1:-1]
-    etag_multipart = '-' in md5_remote # Check for multipart, etag is not md5
-    if etag_multipart is True:
-        module.fail_json(msg="Files uploaded with multipart of s3 are not supported with checksum, unable to compute checksum.")
+    # ignore count side of the etag if file was multipart
+    if '-' in md5_remote:
+        md5_remote, file_count = md5_remote.split('-')
+    
     return md5_remote
+
+def calculate_multipart_md5(src, chunk_size_in_mb):
+    """
+    AWS doesn't set a multipart file's "etag" equal to the md5 of the final
+    (potentially 5TB) file. Instead, AWS:
+        1.) gets the raw md5 bytes of each file part
+        2.) concatenates them into a single string/byte array
+        3.) sets etag to the hexdigest of this collection of bytes
+    
+    Note: the same file will have a different "multipart hash" if different 
+        chunk sizes are used
+    """
+    file_size = os.path.getsize(src)
+    all_chunk_md5 = []
+
+    with open(src, 'rb') as srcfile:
+        chunk_size_in_bytes = chunk_size_in_mb * 1024 * 1024
+        bytes_read = 0
+        tmp_filename = '%s.tmppart' % src
+
+        # Gather all separate *binary* md5 digests of every chunk
+        while bytes_read < file_size:
+            _m = md5()
+            # Read for chunk size or remaining bytes, if at end of file
+            bytes_remaining = file_size - bytes_read
+            bytes_to_read = min(chunk_size_in_bytes, bytes_remaining)
+
+            tmp_bytes = srcfile.read(bytes_to_read)
+            _m.update(tmp_bytes)
+            all_chunk_md5.append(_m.digest())
+
+            bytes_read += bytes_to_read
+    
+    # Concatenate all bytes and return *hexdigest* md5
+    full_md5_bytes = ''.join(all_chunk_md5)
+    final_md5 = md5(full_md5_bytes).hexdigest()
+
+    return final_md5
+
 
 def bucket_check(module, s3, bucket):
     try:
@@ -320,9 +367,13 @@ def upload_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, heade
         module.fail_json(msg= str(e))
 
 
-def upload_multipart_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers):
-    # 5GB limit for single PUT operation in S3
-    chunk_size_in_mb = 5000
+def upload_multipart_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers, chunk_size_in_mb):
+    """
+    Uploads file in multiple parts. AWS min/max chunk size: 5MB/5GB
+    """
+    if chunk_size_in_mb < 5 or chunk_size_in_mb > 5000:
+        module.fail_json(msg='Chunk Size must be between 5 and 5000 MB. Default: 1024')
+        
     bucket = s3.lookup(bucket)
     mpart = bucket.initiate_multipart_upload(obj, encrypt_key=encrypt, headers=headers)
 
@@ -334,21 +385,24 @@ def upload_multipart_s3file(module, s3, bucket, obj, src, expiry, metadata, encr
         file_size = os.path.getsize(src)
 
         with open(src, 'rb') as srcfile:
-            chunk_size = chunk_size_in_mb * 1024 * 1024
+            chunk_size_in_bytes = chunk_size_in_mb * 1024 * 1024
             bytes_read = 0
             chunk_count = 1
 
             while bytes_read < file_size:
                 # Read for chunk size or remaining bytes, if at end of file)
                 bytes_remaining = file_size - bytes_read
-                bytes_to_read = min(chunk_size, bytes_remaining)
-                # Currently will overwrite any parts if the whole is present
-                mp.upload_part_from_file(fp=srcfile, part_num=chunk_count, size=bytes_to_read)
+                bytes_to_read = min(chunk_size_in_bytes, bytes_remaining)
+                mpart.upload_part_from_file(fp=srcfile, part_num=chunk_count, size=bytes_to_read)
                 chunk_count += 1
                 bytes_read += bytes_to_read
 
-        completed_mp = mpart.complete_upload()
-        url = completed.location
+        completed_mpart = mpart.complete_upload()
+        
+        # Set permissions and get URL for completed file
+        mp_key = bucket.get_key(completed_mpart.key_name)
+        mp_key.set_acl(module.params.get('permission'))
+        url = mp_key.generate_url(expiry)
         module.exit_json(msg="PUT operation complete", url=url, changed=True)
     except s3.provider.storage_copy_error, e:
         module.fail_json(msg= str(e))
@@ -413,6 +467,7 @@ def main():
     argument_spec = ec2_argument_spec()
     argument_spec.update(dict(
             bucket         = dict(required=True),
+            chunk_size     = dict(default=1024, type='int'),
             dest           = dict(default=None),
             encrypt        = dict(default=True, type='bool'),
             expiry         = dict(default=600, aliases=['expiration']),
@@ -421,7 +476,7 @@ def main():
             max_keys       = dict(default=1000),
             metadata       = dict(type='dict'),
             mode           = dict(choices=['get', 'put', 'delete', 'create', 'geturl', 'getstr', 'delobj', 'list'], required=True),
-            multipart      = dict(default=False, type='bool')
+            multipart      = dict(default=False, type='bool'),
             object         = dict(),
             permission     = dict(type='list', default=['private']),
             version        = dict(default=None),
@@ -438,6 +493,7 @@ def main():
         module.fail_json(msg='boto required for this module')
 
     bucket = module.params.get('bucket')
+    chunk_size = module.params.get('chunk_size')
     encrypt = module.params.get('encrypt')
     expiry = int(module.params['expiry'])
     if module.params.get('dest'):
@@ -569,7 +625,6 @@ def main():
 
     # if our mode is a PUT operation (upload), go through the procedure as appropriate ...
     if mode == 'put':
-
         # Use this snippet to debug through conditionals:
 #       module.exit_json(msg="Bucket return %s"%bucketrtn)
 #       sys.exit(0)
@@ -586,27 +641,31 @@ def main():
 
         # Lets check key state. Does it exist and if it does, compute the etag md5sum.
         if bucketrtn is True and keyrtn is True:
-                md5_remote = keysum(module, s3, bucket, obj)
+            md5_remote = keysum(module, s3, bucket, obj)
+            if multipart is False:
                 md5_local = module.md5(src)
+            else:
+                # md5 is different for 
+                md5_local = calculate_multipart_md5(src, chunk_size)
 
-                if md5_local == md5_remote:
-                    sum_matches = True
-                    if overwrite == 'always':
-                        if multipart is False:
-                            upload_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
-                        else:
-                            upload_multipart_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
+            if md5_local == md5_remote:
+                sum_matches = True
+                if overwrite == 'always':
+                    if multipart is False:
+                        upload_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
                     else:
-                        get_download_url(module, s3, bucket, obj, expiry, changed=False)
+                        upload_multipart_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers, chunk_size)
                 else:
-                    sum_matches = False
-                    if overwrite in ('always', 'different'):
-                        if multipart is False:
-                            upload_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
-                        else:
-                            upload_multipart_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
+                    get_download_url(module, s3, bucket, obj, expiry, changed=False)
+            else:
+                sum_matches = False
+                if overwrite in ('always', 'different'):
+                    if multipart is False:
+                        upload_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
                     else:
-                        module.exit_json(msg="WARNING: Checksums do not match. Use overwrite parameter to force upload.")
+                        upload_multipart_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers, chunk_size)
+                else:
+                    module.exit_json(msg="WARNING: Checksums do not match. Use overwrite parameter to force upload.")
 
         # If neither exist (based on bucket existence), we can create both.
         if bucketrtn is False and pathrtn is True:
@@ -614,14 +673,14 @@ def main():
             if multipart is False:
                 upload_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
             else:
-                upload_multipart_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
+                upload_multipart_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers, chunk_size)
 
         # If bucket exists but key doesn't, just upload.
         if bucketrtn is True and pathrtn is True and keyrtn is False:
             if multipart is False:
                 upload_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
             else:
-                upload_multipart_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
+                upload_multipart_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers, chunk_size)
 
     # Delete an object from a bucket, not the entire bucket
     if mode == 'delobj':
