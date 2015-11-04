@@ -371,8 +371,8 @@ def upload_multipart_s3file(module, s3, bucket, obj, src, expiry, metadata, encr
     """
     Uploads file in multiple parts. AWS min/max chunk size: 5MB/5GB
     """
-    if chunk_size_in_mb < 5 or chunk_size_in_mb > 5000:
-        module.fail_json(msg='Chunk Size must be between 5 and 5000 MB. Default: 1024')
+    if chunk_size_in_mb < 5 or chunk_size_in_mb > 5120:
+        module.fail_json(msg='Chunk Size must be between 5MB and 5GB. Default: 1024')
 
     bucket = s3.lookup(bucket)
     mpart = bucket.initiate_multipart_upload(obj, encrypt_key=encrypt, headers=headers)
